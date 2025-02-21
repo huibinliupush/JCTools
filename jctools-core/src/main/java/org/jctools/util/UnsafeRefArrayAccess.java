@@ -107,6 +107,9 @@ public final class UnsafeRefArrayAccess
      */
     public static long calcCircularRefElementOffset(long index, long mask)
     {
+        // REF_ARRAY_BASE 表示数组对象数据区的起始地址（跳过数组对象头）
+        // index & mask 定位 index 在环形数组中的位置（index 是绝对值，只增不减）
+        // REF_ELEMENT_SHIFT 队列元素大小
         return REF_ARRAY_BASE + ((index & mask) << REF_ELEMENT_SHIFT);
     }
 

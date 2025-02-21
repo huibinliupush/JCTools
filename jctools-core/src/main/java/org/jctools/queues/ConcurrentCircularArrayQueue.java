@@ -50,10 +50,12 @@ abstract class ConcurrentCircularArrayQueue<E> extends ConcurrentCircularArrayQu
     implements MessagePassingQueue<E>, IndexedQueue, QueueProgressIndicators, SupportsIterator
 {
     protected final long mask;
+    // 环形数组
     protected final E[] buffer;
 
     ConcurrentCircularArrayQueue(int capacity)
     {
+        // 2 的次幂
         int actualCapacity = Pow2.roundToPowerOfTwo(capacity);
         mask = actualCapacity - 1;
         buffer = allocateRefArray(actualCapacity);

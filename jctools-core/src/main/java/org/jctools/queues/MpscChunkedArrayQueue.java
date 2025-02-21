@@ -31,6 +31,9 @@ abstract class MpscChunkedArrayQueueColdProducerFields<E> extends BaseMpscLinked
         RangeUtil.checkGreaterThanOrEqual(maxCapacity, 4, "maxCapacity");
         RangeUtil.checkLessThan(roundToPowerOfTwo(initialCapacity), roundToPowerOfTwo(maxCapacity),
             "initialCapacity");
+        // 这里的实现语义和 MpscUnboundedArrayQueue 一样，相关 index 的增长步长是 2
+        // 所以 mask , productLimit , 以及这里的 maxQueueCapacity 都是原来的两倍
+        // 但实际上这里要表达的语义其实是队列的最大容量是 maxCapacity（最接近它的 Pow2）
         maxQueueCapacity = ((long) Pow2.roundToPowerOfTwo(maxCapacity)) << 1;
     }
 }

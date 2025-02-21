@@ -42,6 +42,10 @@ public class MpscUnboundedArrayQueueSnapshotTest {
     }
 
     @Test
+    public void test() {
+        System.out.println((8 - 1) << 1);
+    }
+    @Test
     public void testIterator() {
         queue.offer(0);
         assertThat(iteratorToList(), contains(0));

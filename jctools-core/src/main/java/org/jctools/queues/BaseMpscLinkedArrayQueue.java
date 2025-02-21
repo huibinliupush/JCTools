@@ -192,13 +192,27 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 
         int p2capacity = Pow2.roundToPowerOfTwo(initialCapacity);
         // leave lower bit of mask clear
+        // (8 - 1) << 1 = 14, mask 最低位清 0
+        // 相关 producerIndex 和 consumerIndex 增加的步长是 2，所以这里的 mask 也应该是 2 倍
+        // 这样根据 index & mask 才能正确定位到 buffer 的 offset
+        // producerIndex 的最低位表示是否正在扩容，所以正常情况下是偶数，只有扩容时候才是奇数
+        // mask 指向的位置正好是 buffer 中最后一个能够存储元素的位置，因为 mask + 1 的位置要存储 JUMP 标识
+        // mask + 2 的位置要存储扩容之后新数组的指针
         long mask = (p2capacity - 1) << 1;
         // need extra element to point at next array
+        // 9 ，多出一个位置放 next array 的指针（扩容时候用）
         E[] buffer = allocateRefArray(p2capacity + 1);
         producerBuffer = buffer;
         producerMask = mask;
         consumerBuffer = buffer;
         consumerMask = mask;
+        // producerIndex 的步长是 2 ，那么 ProducerLimit 也应该是 2 倍
+        // 这里要注意的是 ProducerLimit 指向的是数组倒数第 2 个位置
+        // 比如数组容量是 9 ， ProducerLimit 指向的是 8
+        // producerIndex 等于 8 的时候就应该扩容了，位置 8 存放一个标识 JUMP ,表示这个位置的元素在下一个新数组中存放
+        // 位置 9 存放下一个新的数组指针
+
+        // 对于 MpscArrayQueue 来说, 它的 ProducerLimit 为 capacity
         soProducerLimit(mask); // we know it's all empty to start with
     }
 
@@ -232,17 +246,20 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
             throw new NullPointerException();
         }
 
-        long mask;
-        E[] buffer;
+        long mask; // 14
+        E[] buffer; // 9
         long pIndex;
 
         while (true)
         {
+            // 初始为 mask = 14
             long producerLimit = lvProducerLimit();
             pIndex = lvProducerIndex();
             // lower bit is indicative of resize, if we see it we spin until it's cleared
+            // 最低位 bit 表示扩容。0 表示扩容完毕，1 表示正在扩容
             if ((pIndex & 1) == 1)
             {
+                // 如果正在扩容则自旋等待
                 continue;
             }
             // pIndex is even (lower bit is 0) -> actual index is (pIndex >> 1)
@@ -255,6 +272,8 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
             // assumption behind this optimization is that queue is almost always empty or near empty
             if (producerLimit <= pIndex)
             {
+                // 1. 首先尝试将消费过的元素位置腾挪出来，后续可以将新元素添加到这些已经被消费过的位置
+                // 2. 无法腾挪出位置（生产者速度大于消费者），则对 MpscUnboundedArrayQueue 进行扩容
                 int result = offerSlowPath(mask, pIndex, producerLimit);
                 switch (result)
                 {
@@ -263,19 +282,21 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
                     case RETRY:
                         continue;
                     case QUEUE_FULL:
+                        // MpscChunkedArrayQueue 会受到 maxCapacity 的限制
                         return false;
                     case QUEUE_RESIZE:
                         resize(mask, buffer, pIndex, e, null);
                         return true;
                 }
             }
-
+            // 更新 index 的步长是 2 ，而不是之前 MpscArrayQueue 中的 1
             if (casProducerIndex(pIndex, pIndex + 2))
             {
                 break;
             }
         }
         // INDEX visible before ELEMENT
+        // pIndex 是偶数，自然 mask 也应该是偶数，是之前 MpscArrayQueue 的 2 倍
         final long offset = modifiedCalcCircularRefElementOffset(pIndex, mask);
         soRefElement(buffer, offset, e); // release element e
         return true;
@@ -367,9 +388,10 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
      */
     private int offerSlowPath(long mask, long pIndex, long producerLimit)
     {
+        // index 增加的步长为 2
         final long cIndex = lvConsumerIndex();
         long bufferCapacity = getCurrentBufferCapacity(mask);
-
+        // 已经消费过的位置可以腾挪出来放新元素
         if (cIndex + bufferCapacity > pIndex)
         {
             if (!casProducerLimit(producerLimit, cIndex + bufferCapacity))
@@ -383,13 +405,17 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
                 return CONTINUE_TO_P_INDEX_CAS;
             }
         }
-        // full and cannot grow
+        // full and cannot grow，队列已经满了，但无法扩容，已经达到了最大容量
+        // MpscUnboundedArrayQueue 因为是无界的，这里会返回 Integer.MAX_VALUE，不会走这个分支
+        // MpscChunkedArrayQueue 的容量受到 maxCapacity 的限制，这里会返回 maxQueueCapacity - (pIndex - cIndex)
         else if (availableInQueue(pIndex, cIndex) <= 0)
         {
             // offer should return false;
+            // MpscChunkedArrayQueue 会有队列满的情况，MpscUnboundedArrayQueue 是无界的，没有满的情况
             return QUEUE_FULL;
         }
-        // grab index for resize -> set lower bit
+        // grab index for resize -> set lower bit，队列虽然满了，但未达到最大容量，触发扩容
+        // 当队列满的时候，MpscUnboundedArrayQueue 就会触发扩容
         else if (casProducerIndex(pIndex, pIndex + 1))
         {
             // trigger a resize
@@ -420,6 +446,13 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 
     private static long nextArrayOffset(long mask)
     {
+        // 数组最后一个位置存放新数组的指针
+        // mask 指向数组倒数第 3 的位置，加 2 指向最后一个位置，用来存放下一个新数组指针
+        // mask = capacity -1(语义层面，实际上要乘以2) , length = capacity + 1
+        // mask + 2 = length
+
+        // mask 指向的位置正好是 buffer 中最后一个能够存储元素的位置，因为 mask + 1 的位置要存储 JUMP 标识
+        // mask + 2 的位置要存储扩容之后新数组的指针
         return modifiedCalcCircularRefElementOffset(mask + 2, Long.MAX_VALUE);
     }
 
@@ -728,6 +761,7 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
     private void resize(long oldMask, E[] oldBuffer, long pIndex, E e, Supplier<E> s)
     {
         assert (e != null && s == null) || (e == null || s != null);
+        // oldBuffer 长度
         int newBufferLength = getNextBufferSize(oldBuffer);
         final E[] newBuffer;
         try
@@ -742,13 +776,19 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
         }
 
         producerBuffer = newBuffer;
+        // 原始数组的 mask = （capacity - 1）<< 1
+        // 原始数组的长度 = capacity + 1 , 多出的一个位置用于存放扩容之后新数组的指针
+        // 所以新数组的 mask = (BufferLength - 2) << 1
         final int newMask = (newBufferLength - 2) << 1;
         producerMask = newMask;
 
+        // 原数组倒数第 2 的位置也就是 ProducerLimit 的位置用于存放 JUMP 标识，倒数第 1 的位置存放新数组的指针
         final long offsetInOld = modifiedCalcCircularRefElementOffset(pIndex, oldMask);
         final long offsetInNew = modifiedCalcCircularRefElementOffset(pIndex, newMask);
 
+        // 将元素放入新数组中
         soRefElement(newBuffer, offsetInNew, e == null ? s.get() : e);// element in new array
+        // 将扩容后新数组的指针放入到原数组的最后一个位置（mask+ 2）
         soRefElement(oldBuffer, nextArrayOffset(oldMask), newBuffer);// buffer linked
 
         // ASSERT code
@@ -758,6 +798,8 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
 
         // Invalidate racing CASs
         // We never set the limit beyond the bounds of a buffer
+
+        // pIndex + 扩容后的可用空间
         soProducerLimit(pIndex + Math.min(newMask, availableInQueue));
 
         // make resize visible to the other producers

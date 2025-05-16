@@ -329,7 +329,33 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
             // spin until element is visible.
             do
             {
-                e = lvRefElement(buffer, offset);
+                /**
+                 * 我大概知道这个 bug 的产生原因，这个和 jit 没关系。主要问题导致的就是 jdk 在不同平台内存屏障的实现。从而引用的可见性问题导致的这个死循环。
+                 *
+                 * 这个bug 产生的条件还有一些苛刻：
+                 * 1. 在 poll mpsc 的时候恰巧遇到 mpsc 扩容，就会走到 while 循环里等待扩容结束
+                 * 2. 扩容完之后，jctool 是用 store-store 屏障去写，一个JUMP 标识，这个用来使消费者知道扩容后的新数组位置
+                 * 3. reactor 线程通过 volatile 去读，此时如果不同平台内存屏障的实现差异，可能就会导致可见性问题，导致看不到扩容之后的 JUMP 标识，一直拿到的一直是 null
+                 * 关键是 store-load 这个屏障的实现，可能 jdk8 在 arm 平台实现的问题，StoreLoad 屏障的全局缓存刷新
+                 *
+                 * see : https://github.com/netty/netty/issues/13137
+                 * */
+                // putOrderedObject 写之后，并不能保证其他线程立马读到 : org.jctools.queues.BaseMpscLinkedArrayQueue.resize
+                // store-store 只能保证本次写之前的写操作都能看到，但本次写不会强制刷缓存，所以其他线程可能读不到
+                // 需要同步机制，或者执行一次 volatile 写触发 store-load 屏障才能可见（触发缓存刷新）
+                // see : https://github.com/netty/netty/issues/13137
+                // putOrderedObject 本身并不直接触发全局可见性，仍需后续操作（如 volatile 写）才能完成缓存刷新。
+                // 这里应该随便写入一个 volatile 变量，触发 store-load 屏障，比如用 putOrderedObject 写了 volatile a
+                // 然后这里写一下 volatile b ， 虽然变量不是同一个，但 store-load 可以保证 load(读取 a) 之前的所有写操作可见
+
+                /**
+                 * 不对，不对，这里需要再写线程中执行 volatile 写，也就是说 store-load 应该插到写线程中
+                 * 这样写线程所在 cpu 缓存才能被刷入到主存中
+                 *
+                 * 在读线程中插入 store-load，刷入主存的是读线程 cpu 缓存，还是读取不到
+                 *
+                 * */
+                e = lvRefElement(buffer, offset); // 这里的 volatile 读可能是看不到的
             }
             while (e == null);
         }
@@ -808,6 +834,9 @@ abstract class BaseMpscLinkedArrayQueue<E> extends BaseMpscLinkedArrayQueueColdP
         // INDEX visible before ELEMENT, consistent with consumer expectation
 
         // make resize visible to consumer
+        // putOrderedObject 写之后，并不能保证其他线程立马读到
+        // 需要同步机制，或者执行一次 volatile 写触发 store-load 屏障才能可见
+        // see : https://github.com/netty/netty/issues/13137
         soRefElement(oldBuffer, offsetInOld, JUMP);
     }
 

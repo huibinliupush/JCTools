@@ -109,9 +109,12 @@ abstract class MpscArrayQueueProducerLimitField<E> extends MpscArrayQueueMidPad<
     {
         return producerLimit;
     }
-
+    // 读取 变量 的时候必须使用 volatile 读，因为 putOrderedLong 不保证可见性
     final void soProducerLimit(long newValue)
     {
+        // 只是插入 store-store 屏障，性能开销小，但可以保证写入的顺序性，注意不保证可见性
+        // 如果是 volatile 的写入，那么开销就略大，因为是 store-load 屏障，保证可见性和顺序性
+        // 适用高性能写入
         UNSAFE.putOrderedLong(this, P_LIMIT_OFFSET, newValue);
     }
 }
@@ -161,6 +164,7 @@ abstract class MpscArrayQueueConsumerIndexField<E> extends MpscArrayQueueL2Pad<E
 
     final long lpConsumerIndex()
     {
+        // 注意这个方法是没有内存屏障的
         return UNSAFE.getLong(this, C_INDEX_OFFSET);
     }
 
@@ -211,7 +215,7 @@ public class MpscArrayQueue<E> extends MpscArrayQueueL3Pad<E>
     public MpscArrayQueue(final int capacity)
     {
         super(capacity);
-    }
+    } // 不支持扩容
 
     /**
      * {@link #offer}} if {@link #size()} is less than threshold.
@@ -279,6 +283,8 @@ public class MpscArrayQueue<E> extends MpscArrayQueueL3Pad<E>
      * @see org.jctools.queues.MessagePassingQueue#offer
      *
      * 关键是确定元素的添加位置 ProducerIndex，从而确定元素在环形数组 buffer 中的 offset
+     * 不支持扩容，队列满了就返回 false
+     * 既然不支持扩容，所以相关 index ,capacity 就不必要是偶数了（MpscChunkedArrayQueue,MpscUnboundedArrayQueue），真实就好
      */
     @Override
     public boolean offer(final E e)
@@ -291,7 +297,9 @@ public class MpscArrayQueue<E> extends MpscArrayQueueL3Pad<E>
         // use a cached view on consumer index (potentially updated in loop)
         // actualCapacity - 1
         final long mask = this.mask;
-        long producerLimit = lvProducerLimit();
+        // 对这里的局部变量 producerLimit 读写并没有内存屏障（栈上分配）
+        // 但是对 org.jctools.queues.MpscArrayQueueProducerLimitField.producerLimit 是有内存屏障的（堆上分配）
+        long producerLimit = lvProducerLimit();// 值类型（两块不同的内存，互不影响）
         long pIndex;
         do
         {
@@ -312,11 +320,11 @@ public class MpscArrayQueue<E> extends MpscArrayQueueL3Pad<E>
                 // 从而大幅度减少了 getLongVolatile() 操作的执行次数，性能提升是显著的。
                 final long cIndex = lvConsumerIndex();
                 // 更新 producerLimit ，在原有容量 actualCapacity 的基础之上加上 ConsumerIndex（已经被消费的位置可以重复利用）
-                producerLimit = cIndex + mask + 1;
+                producerLimit = cIndex + mask + 1; // 修改的只是栈上分配的局部变量 producerLimit
                 // 这次队列就是真的满了，生产速度大于消费速度
                 if (pIndex >= producerLimit)
                 {
-                    return false; // FULL :(
+                    return false; // FULL :(  不支持扩容
                 }
                 else
                 {
@@ -342,7 +350,7 @@ public class MpscArrayQueue<E> extends MpscArrayQueueL3Pad<E>
 
                     // putOrderedLong 的写入结果不会立即刷新到主内存，但后续如果有 volatile 写（随便一个 volatile 变量）或 synchronized 块，会触发缓存刷新。
                     // 其他线程可能不会立即看到写入的值，但能保证看到写入的顺序性。
-                    soProducerLimit(producerLimit);
+                    soProducerLimit(producerLimit); // 读取 producerLimit 的时候必须使用 volatile 读，因为 putOrderedLong 不保证可见性
                 }
             }
         }
@@ -364,12 +372,14 @@ public class MpscArrayQueue<E> extends MpscArrayQueueL3Pad<E>
         // 向队列中添加元素
         // putOrderedObject() 使用的是 LazySet 延迟更新机制，所以性能方面 putOrderedObject() 要比 putObject() 高很多
         // 这种方法通常仅在底层字段是 Java 的 volatile 字段时有用（或者如果是数组元素，该元素仅通过 volatile 访问方式访问时有用）。
+        // 因为 putOrderedObject 并不保证可见性，只是保证写入顺序性，所以读的时候必须使用 volatile 读才能保证可见性
+        // 这里是为了提高写入性能
         // putOrderedObject() 并不会立刻将数据更新到内存中，并把其他 Cache Line 置为失效
         // putOrderedObject() 使用了 StoreStore Barrier，对于 Store1，StoreStore，Store2 这样的操作序列，在 Store2 进行写入之前，会保证 Store1 的写操作对其他处理器可见
         // LazySet 机制是有代价的，就是写操作结果有纳秒级的延迟，不会立刻被其他线程以及自身线程可见。
         // 因为在 Mpsc Queue 的使用场景中，多个生产者只负责写入数据，并没有写入之后立刻读取的需求，
         // 所以使用 LazySet 机制是没有问题的，只要 StoreStore Barrier 保证多线程写入的顺序即可。
-        soRefElement(buffer, offset, e);
+        soRefElement(buffer, offset, e); // LazySet 保证高性能写入，但是读取的时候记得要 volatile 读
         return true; // AWESOME :)
     }
 
@@ -437,7 +447,7 @@ public class MpscArrayQueue<E> extends MpscArrayQueueL3Pad<E>
         final E[] buffer = this.buffer;
 
         // If we can't see the next available element we can't poll
-        // Volatile 读取数组中的元素：see UNSAFE.putOrderedObject 方法
+        // Volatile 读取数组中的元素：see UNSAFE.putOrderedObject 方法（为了提高写入性能，写入不保证可见性。所以读取的时候必须 Volatile 读）
         E e = lvRefElement(buffer, offset);
         if (null == e)
         {
@@ -465,7 +475,7 @@ public class MpscArrayQueue<E> extends MpscArrayQueueL3Pad<E>
         spRefElement(buffer, offset, null);
         // LazySet 更新 ConsumerIndex（StoreStore）
         // 其他线程在 offer 的时候看不到最新的也无所谓，比如新值是 4，看到的是 2 ，那么 producerLimit + 2 也是可以的
-        soConsumerIndex(cIndex + 1);
+        soConsumerIndex(cIndex + 1); // 单线程消费，无所谓可见性
         return e;
     }
 
